@@ -7,9 +7,10 @@ export CUDA_VISIBLE_DEVICES=0,1
 # export PYTHONNOUSERSITE=1
 
 # Run training
-python -m torch.distributed.run --nproc_per_node=2 code/swin_unet_ccbd/train_mae.py \
-    --data_root /public/home/wangmo/BIDS_results/20251114_npz/results \
-    --output_dir code/swin_unet_ccbd/checkpoints_mae \
+python -m torch.distributed.run --nproc_per_node=2 train_mae.py \
+    --train_list /public/home/wangmo/swinunet/pretrain/train.txt \
+    --val_list /public/home/wangmo/swinunet/pretrain/val.txt \
+    --output_dir checkpoints_mae \
     --time_window 480 \
     --batch_size 1 \
     --epochs 10 \

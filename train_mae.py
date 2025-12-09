@@ -15,27 +15,31 @@ from swin_unet import SwinUNETR
 from tqdm import tqdm
 
 class FMRIDataset(Dataset):
-    def __init__(self, data_root, time_window=480, transform=None):
+    def __init__(self, data_list_file, time_window=480, transform=None):
         """
         Args:
-            data_root: Root directory containing subject folders.
+            data_list_file: Path to text file containing subject folder paths (one per line).
             time_window: Number of timepoints to use as channels.
             transform: Optional transform to be applied on a sample.
         """
-        self.data_root = data_root
-        # Find all subdirectories in data_root
-        self.subject_ids = [d for d in os.listdir(data_root) if os.path.isdir(os.path.join(data_root, d))]
-        self.subject_ids.sort() # Ensure deterministic order
-        
         self.time_window = time_window
         self.transform = transform
 
+        # Read subject paths from text file
+        self.subject_paths = []
+        with open(data_list_file, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line:  # Skip empty lines
+                    self.subject_paths.append(line)
+
+        print(f"Loaded {len(self.subject_paths)} subjects from {data_list_file}")
+
     def __len__(self):
-        return len(self.subject_ids)
+        return len(self.subject_paths)
 
     def __getitem__(self, idx):
-        sub_id = self.subject_ids[idx]
-        sub_dir = os.path.join(self.data_root, sub_id)
+        sub_dir = self.subject_paths[idx]
         
         # Find all .npz files in the subject directory
         npz_files = [f for f in os.listdir(sub_dir) if f.endswith('.npz')]
@@ -67,7 +71,7 @@ class FMRIDataset(Dataset):
                 continue
 
         if not data_list:
-            print(f"No data found for {sub_id}")
+            print(f"No data found for {sub_dir}")
             return torch.zeros((self.time_window, 96, 96, 96))
 
         # Concatenate along the last dimension (time)
@@ -75,7 +79,7 @@ class FMRIDataset(Dataset):
         try:
             sample = np.concatenate(data_list, axis=-1) # (96, 96, 96, T_total)
         except ValueError as e:
-            print(f"Error concatenating data for {sub_id}: {e}")
+            print(f"Error concatenating data for {sub_dir}: {e}")
             return torch.zeros((self.time_window, 96, 96, 96))
         
         total_timepoints = sample.shape[-1]
@@ -164,19 +168,35 @@ def train(args):
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
-    
-    # Dataset and DataLoader
-    dataset = FMRIDataset(
-        data_root=args.data_root,
+
+    # Training Dataset and DataLoader
+    train_dataset = FMRIDataset(
+        data_list_file=args.train_list,
         time_window=args.time_window
     )
-    
-    sampler = DistributedSampler(dataset, shuffle=True)
-    
-    dataloader = DataLoader(
-        dataset, 
-        batch_size=args.batch_size, 
-        sampler=sampler,
+
+    train_sampler = DistributedSampler(train_dataset, shuffle=True)
+
+    train_dataloader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        sampler=train_sampler,
+        num_workers=args.num_workers,
+        pin_memory=True
+    )
+
+    # Validation Dataset and DataLoader
+    val_dataset = FMRIDataset(
+        data_list_file=args.val_list,
+        time_window=args.time_window
+    )
+
+    val_sampler = DistributedSampler(val_dataset, shuffle=False)
+
+    val_dataloader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        sampler=val_sampler,
         num_workers=args.num_workers,
         pin_memory=True
     )
@@ -207,99 +227,137 @@ def train(args):
     if dist.get_rank() == 0:
         writer = SummaryWriter(log_dir=os.path.join(args.output_dir, 'logs'))
         print(f"Starting training on {device}...")
-        
+
         # Initialize CSV log file
         csv_log_path = os.path.join(args.output_dir, 'loss_log.csv')
         with open(csv_log_path, 'w', newline='') as f:
             csv_writer = csv.writer(f)
-            csv_writer.writerow(['epoch', 'loss'])
+            csv_writer.writerow(['epoch', 'train_loss', 'val_loss'])
     else:
         writer = None
     
     criterion = nn.MSELoss(reduction='none')
-    
+
     for epoch in range(args.epochs):
-        sampler.set_epoch(epoch)
+        # ============ Training Phase ============
+        train_sampler.set_epoch(epoch)
         model.train()
-        epoch_loss = 0
-        
+        train_epoch_loss = 0
+
         if dist.get_rank() == 0:
-            progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{args.epochs}")
+            progress_bar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{args.epochs} [Train]")
         else:
-            progress_bar = dataloader
-        
+            progress_bar = train_dataloader
+
         embedding = None
         for step, batch in enumerate(progress_bar):
             batch = batch.to(device)
-            
+
             # Generate mask
             masked_batch, mask = mask_generator(batch)
-            
+
             # Forward pass
             outputs, embedding = model(masked_batch)
-            
+
             # Compute loss
             # Loss is computed only on masked regions (SimMIM style) or all (standard AE)
             # MAE usually computes loss only on masked patches.
-            
+
             loss = criterion(outputs, batch)
-            
+
             if args.loss_on_masked_only:
                 loss = (loss * mask).sum() / (mask.sum() + 1e-6)
             else:
                 loss = loss.mean()
-            
+
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            
+
             # Reduce loss for logging
             dist.all_reduce(loss, op=dist.ReduceOp.SUM)
             loss /= dist.get_world_size()
-            
-            epoch_loss += loss.item()
+
+            train_epoch_loss += loss.item()
             if dist.get_rank() == 0:
                 progress_bar.set_postfix({"loss": loss.item()})
-                
+
                 # Log loss to TensorBoard
-                global_step = epoch * len(dataloader) + step
+                global_step = epoch * len(train_dataloader) + step
                 writer.add_scalar('Loss/train', loss.item(), global_step)
 
-        # Print embedding of the last subject in the last batch
-        if dist.get_rank() == 0 and embedding is not None:
-            last_embedding = embedding[-1].detach().cpu()
-            print(f"\nEpoch {epoch+1} Last Subject Embedding Shape: {last_embedding.shape}")
-            print(f"Epoch {epoch+1} Last Subject Embedding (first channel, middle slice):")
-            print(last_embedding[0, last_embedding.shape[1]//2])
-        
-        avg_loss = epoch_loss / len(dataloader)
+        avg_train_loss = train_epoch_loss / len(train_dataloader)
+
+        # ============ Validation Phase ============
+        model.eval()
+        val_epoch_loss = 0
+
         if dist.get_rank() == 0:
-            print(f"Epoch {epoch+1} Average Loss: {avg_loss:.6f}")
-            
-            # Write loss to CSV
+            val_progress_bar = tqdm(val_dataloader, desc=f"Epoch {epoch+1}/{args.epochs} [Val]")
+        else:
+            val_progress_bar = val_dataloader
+
+        with torch.no_grad():
+            for step, batch in enumerate(val_progress_bar):
+                batch = batch.to(device)
+
+                # Generate mask
+                masked_batch, mask = mask_generator(batch)
+
+                # Forward pass
+                outputs, _ = model(masked_batch)
+
+                # Compute loss
+                loss = criterion(outputs, batch)
+
+                if args.loss_on_masked_only:
+                    loss = (loss * mask).sum() / (mask.sum() + 1e-6)
+                else:
+                    loss = loss.mean()
+
+                # Reduce loss for logging
+                dist.all_reduce(loss, op=dist.ReduceOp.SUM)
+                loss /= dist.get_world_size()
+
+                val_epoch_loss += loss.item()
+                if dist.get_rank() == 0:
+                    val_progress_bar.set_postfix({"val_loss": loss.item()})
+
+        avg_val_loss = val_epoch_loss / len(val_dataloader)
+
+        # ============ Logging and Checkpointing ============
+        if dist.get_rank() == 0:
+            print(f"\nEpoch {epoch+1}/{args.epochs} - Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}")
+
+            # Log to TensorBoard
+            writer.add_scalar('Loss/train_epoch', avg_train_loss, epoch)
+            writer.add_scalar('Loss/val_epoch', avg_val_loss, epoch)
+
+            # Write losses to CSV
             with open(csv_log_path, 'a', newline='') as f:
                 csv_writer = csv.writer(f)
-                csv_writer.writerow([epoch + 1, avg_loss])
-            
-            # Save checkpoint
-            if (epoch + 1) % args.save_interval == 0:
-                save_path = os.path.join(args.output_dir, f"checkpoint_epoch_{epoch+1}.pth")
-                torch.save({
-                    'epoch': epoch + 1,
-                    'model_state_dict': model.module.state_dict(), # Save module state dict
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'loss': avg_loss,
-                }, save_path)
-                print(f"Saved checkpoint to {save_path}")
+                csv_writer.writerow([epoch + 1, avg_train_loss, avg_val_loss])
+
+            # Save checkpoint every epoch
+            save_path = os.path.join(args.output_dir, f"checkpoint_epoch_{epoch+1}.pth")
+            torch.save({
+                'epoch': epoch + 1,
+                'model_state_dict': model.module.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'train_loss': avg_train_loss,
+                'val_loss': avg_val_loss,
+            }, save_path)
+            print(f"Saved checkpoint to {save_path}")
     
     dist.destroy_process_group()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SwinUNETR MAE Pretraining for fMRI")
-    
-    parser.add_argument("--data_root", type=str, default="/public/home/wangmo/BIDS_results/20251114_npz/results", help="Root directory containing subject folders")
+
+    parser.add_argument("--train_list", type=str, default="/public/home/wangmo/swinunet/pretrain/train.txt", help="Path to text file containing training subject paths")
+    parser.add_argument("--val_list", type=str, default="/public/home/wangmo/swinunet/pretrain/val.txt", help="Path to text file containing validation subject paths")
     parser.add_argument("--output_dir", type=str, default="checkpoints", help="Directory to save checkpoints")
-    parser.add_argument("--time_window", type=int, default=1, help="Number of timepoints to use as channels")
+    parser.add_argument("--time_window", type=int, default=480, help="Number of timepoints to use as channels (12 files * 40 = 480)")
     parser.add_argument("--batch_size", type=int, default=2, help="Batch size")
     parser.add_argument("--epochs", type=int, default=100, help="Number of epochs")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
@@ -310,10 +368,9 @@ if __name__ == "__main__":
     parser.add_argument("--mask_ratio", type=float, default=0.75, help="Masking ratio")
     parser.add_argument("--mask_patch_size", type=int, nargs=3, default=[4, 4, 4], help="Patch size for masking")
     parser.add_argument("--loss_on_masked_only", action="store_true", default=True, help="Compute loss only on masked regions")
-    parser.add_argument("--save_interval", type=int, default=1, help="Save checkpoint every N epochs")
-    
+
     args = parser.parse_args()
-    
+
     os.makedirs(args.output_dir, exist_ok=True)
-    
+
     train(args)
